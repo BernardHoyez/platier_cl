@@ -6,11 +6,16 @@
 'use strict';
 
 // ─── CONSTANTES API IGN ───────────────────────────────────────────
-const IGN_WCS_BASE   = 'https://data.geopf.fr/wcs';
+// API REST altimétrique Geoplateforme (remplace WCS déprécié)
+const IGN_ALTI_URL   = 'https://data.geopf.fr/altimetrie/1.0/calcul/alti/rest/elevation.json';
+const IGN_ALTI_RES   = 'ign_rge_alti_wld';   // ressource RGE Alti monde
 const IGN_WMTS_BASE  = 'https://data.geopf.fr/wmts';
 const IGN_ORTHO_LAYER = 'ORTHOIMAGERY.ORTHOPHOTOS';
-const IGN_ALTI_LAYER  = 'ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES';
 const SHOM_WFS_BASE  = 'https://services.data.shom.fr/INSPIRE/wfs';
+
+// Limite IGN : 40 points max par requête GET, 5 req/s
+const ALTI_BATCH_SIZE = 40;
+const ALTI_DELAY_MS   = 250; // 4 req/s pour rester sous la limite
 
 // Tolérance de simplification du polygone estran (degrés)
 const SIMPLIFY_TOL = 0.00005;
@@ -190,137 +195,83 @@ async function fetchAb(url, opts = {}) {
   return r;
 }
 
-// ─── IGN WCS — RGE ALTI ───────────────────────────────────────────
-async function fetchMNT(bbox, res) {
-  // WCS 2.0 — GeoTIFF 32-bit float
-  const resDeg = res / 111320; // approx
-  const w = Math.ceil((bbox.maxLon - bbox.minLon) / resDeg);
-  const h = Math.ceil((bbox.maxLat - bbox.minLat) / resDeg);
-  const maxDim = 2000;
-  const scaleW = w > maxDim ? maxDim : w;
-  const scaleH = h > maxDim ? maxDim : h;
+// ─── IGN API REST ALTIMÉTRIQUE — RGE Alti ─────────────────────────
+// Remplace l'ancien WCS (404). L'API retourne l'altitude de points discrets.
+// On échantillonne une grille régulière sur la bbox, par lots de 40 points.
+async function fetchMNT(bbox, res, onProgress) {
+  // Résolution en degrés (approx, latitude moyenne)
+  const latMid  = (bbox.minLat + bbox.maxLat) / 2;
+  const mPerDegLon = 111320 * Math.cos(latMid * Math.PI / 180);
+  const mPerDegLat = 111320;
+  const stepLon = res / mPerDegLon;
+  const stepLat = res / mPerDegLat;
 
-  const url = IGN_WCS_BASE + '?' + new URLSearchParams({
-    SERVICE: 'WCS', VERSION: '2.0.1', REQUEST: 'GetCoverage',
-    COVERAGEID: IGN_ALTI_LAYER,
-    SUBSET: `Long(${bbox.minLon},${bbox.maxLon})`,
-    SUBSETTING_CRS: 'http://www.opengis.net/def/crs/EPSG/0/4326',
-    SUBSETBY: `Lat(${bbox.minLat},${bbox.maxLat})`,
-    format: 'image/tiff',
-    SCALESIZE: `Long(${scaleW}),Lat(${scaleH})`,
-  });
+  // Limiter la grille à 100×100 = 10 000 points max (évite trop de requêtes)
+  const maxCols = 100, maxRows = 100;
+  const rawCols = Math.ceil((bbox.maxLon - bbox.minLon) / stepLon);
+  const rawRows = Math.ceil((bbox.maxLat - bbox.minLat) / stepLat);
+  const cols = Math.min(rawCols, maxCols);
+  const rows = Math.min(rawRows, maxRows);
+  const actualStepLon = (bbox.maxLon - bbox.minLon) / (cols - 1 || 1);
+  const actualStepLat = (bbox.maxLat - bbox.minLat) / (rows - 1 || 1);
 
-  log('Téléchargement MNT IGN (RGE Alti)…', 'info');
-  const r = await fetchAb(url);
-  const buf = await r.arrayBuffer();
-  log(`MNT reçu : ${(buf.byteLength/1024).toFixed(1)} Ko`, 'ok');
-  return { buf, width: scaleW, height: scaleH, bbox };
-}
+  log(`Grille MNT : ${cols} × ${rows} = ${cols*rows} points (résolution ~${res} m)`, 'info');
 
-// ─── PARSE GEOTIFF SIMPLIFIÉ (float32 single-band) ────────────────
-// On utilise une approche manuelle pour lire les valeurs pixel du GeoTIFF.
-// Pour les GeoTIFF IGN, on s'appuie sur le format connu (TIFF float32 big-endian ou little-endian).
-async function parseTiffToGrid(buf) {
-  // Chargement via image bitmap si possible, sinon parsing manuel
-  // On utilise une approche canvas/createImageBitmap pour les tiffs 8-bit,
-  // mais pour les tiffs float32 on doit parser le header TIFF.
-  return parseTiffFloat32(buf);
-}
-
-function parseTiffFloat32(buf) {
-  const view = new DataView(buf);
-  const le = (view.getUint16(0) === 0x4949); // little-endian = II
-
-  function ru16(o) { return view.getUint16(o, le); }
-  function ru32(o) { return view.getUint32(o, le); }
-  function ri32(o) { return view.getInt32(o, le); }
-  function rf32(o) { return view.getFloat32(o, le); }
-
-  const ifdOffset = ru32(4);
-  const numEntries = ru16(ifdOffset);
-
-  let width=0, height=0, bitsPerSample=0, sampleFormat=0;
-  let stripOffsets=[], stripByteCounts=[], rowsPerStrip=0;
-  let tileOffsets=[], tileByteCounts=[], tileWidth=0, tileHeight=0;
-  let nodata = -9999;
-  let samplesPerPixel = 1;
-  let planarConfig = 1;
-  let compression = 1;
-
-  for (let i = 0; i < numEntries; i++) {
-    const base = ifdOffset + 2 + i * 12;
-    const tag = ru16(base);
-    const type = ru16(base + 2);
-    const count = ru32(base + 4);
-    let val;
-    if (type === 3) val = ru16(base + 8);
-    else if (type === 4) val = ru32(base + 8);
-    else if (type === 5) { const off = ru32(base+8); val = ru32(off) / ru32(off+4); }
-    else val = ru32(base + 8);
-
-    switch(tag) {
-      case 256: width = val; break;
-      case 257: height = val; break;
-      case 258: bitsPerSample = val; break;
-      case 259: compression = val; break;
-      case 278: rowsPerStrip = val; break;
-      case 273: { // strip offsets
-        if (count === 1) stripOffsets = [val];
-        else { const off = val; stripOffsets = []; for(let j=0;j<count;j++) stripOffsets.push(type===3?ru16(off+j*2):ru32(off+j*4)); }
-        break; }
-      case 279: { // strip byte counts
-        if (count === 1) stripByteCounts = [val];
-        else { const off = val; stripByteCounts = []; for(let j=0;j<count;j++) stripByteCounts.push(type===3?ru16(off+j*2):ru32(off+j*4)); }
-        break; }
-      case 277: samplesPerPixel = val; break;
-      case 284: planarConfig = val; break;
-      case 339: sampleFormat = val; break;
-      case 322: tileWidth = val; break;
-      case 323: tileHeight = val; break;
-      case 324: { const off = ru32(base+8); tileOffsets=[]; for(let j=0;j<count;j++) tileOffsets.push(ru32(off+j*4)); break; }
-      case 325: { const off = ru32(base+8); tileByteCounts=[]; for(let j=0;j<count;j++) tileByteCounts.push(ru32(off+j*4)); break; }
+  // Construire la liste de tous les points
+  const allLons = [], allLats = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      allLons.push(bbox.minLon + c * actualStepLon);
+      allLats.push(bbox.maxLat - r * actualStepLat); // lat décroissante (ligne 0 = nord)
     }
   }
 
-  // Allouer grille
-  const grid = new Float32Array(width * height).fill(NaN);
+  const total = allLons.length;
+  const grid = new Float32Array(total).fill(NaN);
 
-  if (tileOffsets.length > 0) {
-    // TILED
-    const tilesAcross = Math.ceil(width / tileWidth);
-    const tilesDown   = Math.ceil(height / tileHeight);
-    for (let ti = 0; ti < tileOffsets.length; ti++) {
-      const tx = (ti % tilesAcross) * tileWidth;
-      const ty = Math.floor(ti / tilesAcross) * tileHeight;
-      const off = tileOffsets[ti];
-      for (let py = 0; py < tileHeight; py++) {
-        for (let px = 0; px < tileWidth; px++) {
-          const gx = tx + px; const gy = ty + py;
-          if (gx < width && gy < height) {
-            const dataOff = off + (py * tileWidth + px) * 4;
-            const v = rf32(dataOff);
-            grid[gy * width + gx] = (v === nodata || isNaN(v)) ? NaN : v;
-          }
-        }
-      }
+  log(`Interrogation API altimétrique IGN (${Math.ceil(total/ALTI_BATCH_SIZE)} requêtes)…`, 'info');
+
+  for (let i = 0; i < total; i += ALTI_BATCH_SIZE) {
+    if (state.abortCtrl?.signal.aborted) throw new Error('Annulé');
+
+    const bLons = allLons.slice(i, i + ALTI_BATCH_SIZE);
+    const bLats = allLats.slice(i, i + ALTI_BATCH_SIZE);
+
+    const url = IGN_ALTI_URL + '?' + new URLSearchParams({
+      lon:      bLons.map(v => v.toFixed(6)).join('|'),
+      lat:      bLats.map(v => v.toFixed(6)).join('|'),
+      resource: IGN_ALTI_RES,
+      delimiter: '|',
+      indent:   'false',
+      measures: 'false',
+      zonly:    'false',
+    });
+
+    const r = await fetchAb(url);
+    const data = await r.json();
+    const elevs = data.elevations || [];
+    for (let j = 0; j < elevs.length; j++) {
+      const z = elevs[j].z;
+      // IGN retourne -99999 pour les zones non couvertes
+      grid[i + j] = (z === null || z < -9990) ? NaN : z;
     }
-  } else {
-    // STRIPPED
-    let row = 0;
-    for (let si = 0; si < stripOffsets.length; si++) {
-      const off = stripOffsets[si];
-      const rows = rowsPerStrip || height;
-      for (let sr = 0; sr < rows && row < height; sr++, row++) {
-        for (let col = 0; col < width; col++) {
-          const dataOff = off + (sr * width + col) * 4;
-          const v = rf32(dataOff);
-          grid[row * width + col] = (v <= nodata + 1 && v >= nodata - 1) ? NaN : v;
-        }
-      }
+
+    if (onProgress) onProgress(Math.min(i + ALTI_BATCH_SIZE, total), total);
+
+    // Respecter la limite de taux (5 req/s)
+    if (i + ALTI_BATCH_SIZE < total) {
+      await new Promise(res => setTimeout(res, ALTI_DELAY_MS));
     }
   }
 
-  return { grid, width, height };
+  // Statistiques
+  let vmin=Infinity, vmax=-Infinity, cnt=0;
+  for (let i=0; i<grid.length; i++) {
+    if (!isNaN(grid[i])) { if(grid[i]<vmin)vmin=grid[i]; if(grid[i]>vmax)vmax=grid[i]; cnt++; }
+  }
+  log(`Grille MNT reçue : ${cnt}/${total} points valides, alt. ${vmin.toFixed(2)}–${vmax.toFixed(2)} m`, 'ok');
+
+  return { grid, width: cols, height: rows, bbox };
 }
 
 // ─── EXTRACTION CONTOUR ESTRAN ────────────────────────────────────
@@ -619,28 +570,28 @@ async function runPipeline() {
   const zoom    = parseInt($('orthoZoom').value) || 17;
 
   try {
-    // ── ÉTAPE 1 : MNT ────────────────────────────────────────────
-    setProgress('Téléchargement MNT IGN…', 5);
-    const mnt = await fetchMNT(bbox, res);
+    // ── ÉTAPE 1 : MNT via API REST IGN altimétrique ───────────────
+    setProgress('Téléchargement altimétrie IGN RGE Alti…', 5);
+    log('Téléchargement MNT IGN via API REST altimétrique…', 'info');
+    const { grid, width, height } = await fetchMNT(bbox, res, (done, total) => {
+      const pct = 5 + 25 * (done / total);
+      setProgress(`Altimétrie : ${done}/${total} points`, pct);
+    });
 
-    // ── ÉTAPE 2 : Parse TIFF ──────────────────────────────────────
-    setProgress('Décodage GeoTIFF…', 20);
-    log('Décodage GeoTIFF float32…', 'info');
-    const { grid, width, height } = await parseTiffToGrid(mnt.buf);
-    log(`Grille MNT : ${width} × ${height} pixels`, 'ok');
-
-    // Statistiques rapides
-    let vmin=Infinity, vmax=-Infinity, cnt=0;
-    for (let i=0; i<grid.length; i++) {
-      if (!isNaN(grid[i])) { if(grid[i]<vmin)vmin=grid[i]; if(grid[i]>vmax)vmax=grid[i]; cnt++; }
+    if (grid.every(v => isNaN(v))) {
+      throw new Error('Aucune donnée altimétrique reçue — vérifiez la zone sélectionnée.');
     }
-    log(`Alt. min/max : ${vmin.toFixed(2)} m / ${vmax.toFixed(2)} m (${cnt} pixels valides)`, 'info');
 
+    // Vérification de la plage altitudinale
+    let vmin=Infinity, vmax=-Infinity;
+    for (let i=0; i<grid.length; i++) {
+      if (!isNaN(grid[i])) { if(grid[i]<vmin)vmin=grid[i]; if(grid[i]>vmax)vmax=grid[i]; }
+    }
     if (vmax < 0 || vmin > pmveAlt) {
       log(`⚠ La zone ne semble pas comporter d'estran (altitude hors [0, ${pmveAlt}])`, 'warn');
     }
 
-    // ── ÉTAPE 3 : Polygone estran ──────────────────────────────────
+    // ── ÉTAPE 2 : Polygone estran ──────────────────────────────────
     setProgress('Construction du polygone estran…', 35);
     const estranPoly = buildEstranPolygon(grid, width, height, bbox, pmveAlt);
 
@@ -656,7 +607,7 @@ async function runPipeline() {
       log('Aucun polygone estran trouvé dans la zone.', 'warn');
     }
 
-    // ── ÉTAPE 4 : Tuiles ortho ────────────────────────────────────
+    // ── ÉTAPE 3 : Tuiles ortho ────────────────────────────────────
     setProgress('Calcul des tuiles WMTS…', 50);
     const tiles = bboxToTiles(bbox, zoom);
     log(`Tuiles WMTS zoom ${zoom} dans la bbox : ${tiles.length}`, 'info');
@@ -665,7 +616,7 @@ async function runPipeline() {
       log(`⚠ ${tiles.length} tuiles — cela peut prendre du temps et consommer de la mémoire.`, 'warn');
     }
 
-    // ── ÉTAPE 5 : MBTiles ─────────────────────────────────────────
+    // ── ÉTAPE 4 : MBTiles ─────────────────────────────────────────
     setProgress('Assemblage MBTiles…', 55);
     log('Démarrage de l\'assemblage MBTiles…', 'info');
 
@@ -678,7 +629,7 @@ async function runPipeline() {
     const sizeKo = (mbtData.byteLength / 1024).toFixed(1);
     const sizeMo = (mbtData.byteLength / 1024 / 1024).toFixed(2);
 
-    // ── ÉTAPE 6 : Proposer le téléchargement ──────────────────────
+    // ── ÉTAPE 5 : Proposer le téléchargement ──────────────────────
     setProgress('Terminé !', 100);
     setStatus('done');
 
