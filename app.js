@@ -1,693 +1,544 @@
 /* ═══════════════════════════════════════════════════════════════
-   PLATIER_CL — Application principale
+   PLATIER_CL v1.6.0 — Application principale
    BernardHoyez.github.io/platier_cl
    ═══════════════════════════════════════════════════════════════ */
-
 'use strict';
 
-// ─── CONSTANTES API IGN ───────────────────────────────────────────
-// API REST altimétrique Geoplateforme (remplace WCS déprécié)
-const IGN_ALTI_URL   = 'https://data.geopf.fr/altimetrie/1.0/calcul/alti/rest/elevation.json';
-const IGN_ALTI_RES   = 'ign_rge_alti_wld';   // ressource RGE Alti monde
-const IGN_WMTS_BASE  = 'https://data.geopf.fr/wmts';
+// ─── CONSTANTES ────────────────────────────────────────────────────
+const IGN_ALTI_URL    = 'https://data.geopf.fr/altimetrie/1.0/calcul/alti/rest/elevation.json';
+const IGN_ALTI_RES    = 'ign_rge_alti_wld';
+const IGN_WMTS_BASE   = 'https://data.geopf.fr/wmts';
 const IGN_ORTHO_LAYER = 'ORTHOIMAGERY.ORTHOPHOTOS';
-const SHOM_WFS_BASE  = 'https://services.data.shom.fr/INSPIRE/wfs';
 
-// Limite IGN : 40 points max par requête GET, 5 req/s
-const ALTI_BATCH_SIZE = 40;
-const ALTI_DELAY_MS   = 250; // 4 req/s pour rester sous la limite
-
-// Tolérance de simplification du polygone estran (degrés)
-const SIMPLIFY_TOL = 0.00005;
-// Surface minimale des îlots à conserver (m²) — nettoyage géométrique
-const MIN_AREA_M2  = 5000;
+const ALTI_BATCH = 40;    // points max par requête IGN
+const ALTI_DELAY = 220;   // ms entre requêtes (< 5 req/s)
+const CONCUR     = 3;     // tuiles téléchargées en parallèle
+const MIN_AREA   = 2000;  // m² minimum pour conserver un polygone
+const SIMPLIFY   = 0.00004;
 
 // ─── STATE ─────────────────────────────────────────────────────────
-let state = {
-  bbox: null,      // {minLon, minLat, maxLon, maxLat}
-  estranPoly: null,// GeoJSON polygon
-  mbtData: null,   // Uint8Array
-  abortCtrl: null,
-  t0: Date.now(),
-};
+const S = { bbox:null, poly:null, mbt:null, abort:null, t0:Date.now() };
 
-// ─── DOM REFS ──────────────────────────────────────────────────────
-const $ = id => document.getElementById(id);
-const logArea      = $('logArea');
-const progressFill = $('progressFill');
-const progressLbl  = $('progressLabel');
-const progressPct  = $('progressPct');
-const globalStatus = $('globalStatus');
-const downloadZone = $('downloadZone');
+// ─── DOM ───────────────────────────────────────────────────────────
+const $  = id => document.getElementById(id);
+const logEl   = $('logArea');
+const fillEl  = $('progressFill');
+const lblEl   = $('progressLabel');
+const pctEl   = $('progressPct');
+const statEl  = $('globalStatus');
+const dlZone  = $('downloadZone');
 
-// ─── LOGGING ───────────────────────────────────────────────────────
+// ─── LOG ───────────────────────────────────────────────────────────
 function ts() {
-  const s = Math.floor((Date.now() - state.t0) / 1000);
-  return String(Math.floor(s/60)).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
+  const s = Math.floor((Date.now()-S.t0)/1000);
+  return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
 }
-function log(msg, level='info') {
+function log(msg, lv='info') {
   const d = document.createElement('div');
-  d.className = `log-line ${level}`;
+  d.className = 'log-line '+lv;
   d.innerHTML = `<span class="ts">${ts()}</span><span class="msg">${msg}</span>`;
-  logArea.appendChild(d);
-  logArea.scrollTop = logArea.scrollHeight;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
 }
 
 // ─── PROGRESS ──────────────────────────────────────────────────────
-function setProgress(label, pct) {
-  progressLbl.textContent = label;
-  progressPct.textContent = Math.round(pct) + ' %';
-  progressFill.style.width = pct + '%';
+// yield() libère le thread pour que le DOM se repeigne
+const yield_ = () => new Promise(r => setTimeout(r, 0));
+
+async function prog(label, pct) {
+  lblEl.textContent  = label;
+  pctEl.textContent  = Math.round(pct)+'%';
+  fillEl.style.width = pct+'%';
+  await yield_();   // ← force le repaint
 }
 
-function setStatus(s) {
-  const cls = {idle:'chip-idle', running:'chip-running', done:'chip-done', error:'chip-error'};
-  const lbl = {idle:'Prêt', running:'En cours…', done:'Terminé', error:'Erreur'};
-  globalStatus.className = 'status-chip ' + (cls[s]||'chip-idle');
-  globalStatus.innerHTML = `<span class="dot"></span> ${lbl[s]||s}`;
+function status(s) {
+  const C = {idle:'chip-idle', run:'chip-running', done:'chip-done', err:'chip-error'};
+  const L = {idle:'Prêt', run:'En cours…', done:'Terminé ✓', err:'Erreur'};
+  statEl.className = 'status-chip '+(C[s]||'chip-idle');
+  statEl.innerHTML = `<span class="dot"></span> ${L[s]||s}`;
 }
 
 // ─── CARTE ─────────────────────────────────────────────────────────
-const map = L.map('map', {
-  center: [47.5, -2.0],
-  zoom: 10,
-  zoomControl: true,
-});
+const map = L.map('map',{center:[47.5,-2.0],zoom:10});
 
-// Fond carte IGN Plan
-L.tileLayer('https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0' +
+L.tileLayer(
+  'https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0' +
   '&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&FORMAT=image/png' +
-  '&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}', {
-  attribution: '© IGN Geoplateforme',
-  maxZoom: 18,
-}).addTo(map);
+  '&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}',
+  {attribution:'© IGN Geoplateforme', maxZoom:18}
+).addTo(map);
 
-// Couche ortho (visible après sélection zone)
-const orthoLayer = L.tileLayer(
-  IGN_WMTS_BASE + '?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0' +
+const orthoLyr = L.tileLayer(
+  IGN_WMTS_BASE+'?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0' +
   `&LAYER=${IGN_ORTHO_LAYER}&STYLE=normal&FORMAT=image/jpeg` +
   '&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}',
-  { maxZoom: 20, opacity: 0.7, attribution: '© IGN BD Ortho' }
+  {maxZoom:20, opacity:0.65}
 );
 
 // Leaflet Draw
-const drawnItems = new L.FeatureGroup().addTo(map);
-const drawControl = new L.Control.Draw({
-  draw: {
-    rectangle: { shapeOptions: { color: '#00c8a0', weight: 2 } },
-    polygon: false, polyline: false, circle: false,
-    circlemarker: false, marker: false,
-  },
-  edit: { featureGroup: drawnItems, remove: true },
-});
-map.addControl(drawControl);
+const drawn = new L.FeatureGroup().addTo(map);
+map.addControl(new L.Control.Draw({
+  draw:{ rectangle:{shapeOptions:{color:'#00c8a0',weight:2}},
+         polygon:false,polyline:false,circle:false,circlemarker:false,marker:false },
+  edit:{ featureGroup:drawn, remove:true }
+}));
 
-// Layer estran
-let estranLayer = null;
+let estranLyr = null;
 
 map.on(L.Draw.Event.CREATED, e => {
-  drawnItems.clearLayers();
-  drawnItems.addLayer(e.layer);
+  drawn.clearLayers(); drawn.addLayer(e.layer);
   const b = e.layer.getBounds();
-  state.bbox = {
-    minLon: b.getWest(), minLat: b.getSouth(),
-    maxLon: b.getEast(), maxLat: b.getNorth(),
-  };
-  updateBboxDisplay();
-  orthoLayer.addTo(map);
-  map.fitBounds(b, { padding: [20,20] });
-  log(`Zone sélectionnée : ${fmt4(state.bbox.minLon)}, ${fmt4(state.bbox.minLat)} → ${fmt4(state.bbox.maxLon)}, ${fmt4(state.bbox.maxLat)}`, 'ok');
-  enableStep2();
+  S.bbox = {minLon:b.getWest(), minLat:b.getSouth(), maxLon:b.getEast(), maxLat:b.getNorth()};
+  updateCoords();
+  orthoLyr.addTo(map);
+  map.fitBounds(b,{padding:[20,20]});
+  log(`Zone : ${fmt(S.bbox.minLon)}, ${fmt(S.bbox.minLat)} → ${fmt(S.bbox.maxLon)}, ${fmt(S.bbox.maxLat)}`,'ok');
+  enableUI(true);
+});
+map.on(L.Draw.Event.DELETED, () => { S.bbox=null; updateCoords(); enableUI(false); });
+
+function fmt(v){ return Number(v).toFixed(4); }
+function updateCoords(){
+  const b=S.bbox;
+  $('cLonMin').textContent = b?fmt(b.minLon):'—';
+  $('cLonMax').textContent = b?fmt(b.maxLon):'—';
+  $('cLatMin').textContent = b?fmt(b.minLat):'—';
+  $('cLatMax').textContent = b?fmt(b.maxLat):'—';
+}
+function enableUI(on){
+  $('btnClear').disabled   = !on;
+  $('btnProcess').disabled = !on;
+  ['step2title','step3title'].forEach(id =>
+    $(id).classList.toggle('inactive',!on));
+}
+
+$('btnClear').addEventListener('click', ()=>{
+  drawn.clearLayers();
+  if(estranLyr){ map.removeLayer(estranLyr); estranLyr=null; }
+  orthoLyr.remove();
+  S.bbox=S.poly=S.mbt=null;
+  dlZone.classList.remove('visible');
+  updateCoords(); enableUI(false);
+  prog('En attente',0); status('idle');
+  log('Zone effacée.','warn');
 });
 
-map.on(L.Draw.Event.DELETED, () => {
-  state.bbox = null;
-  updateBboxDisplay();
-  disableStep2();
+// coords curseur
+const infoEl = $('mapInfo');
+map.on('mousemove', e=>{
+  infoEl.style.display='block';
+  infoEl.textContent=`${e.latlng.lng.toFixed(5)}°E  ${e.latlng.lat.toFixed(5)}°N`;
 });
+map.on('mouseout', ()=>{ infoEl.style.display='none'; });
 
-function fmt4(v) { return Number(v).toFixed(4); }
+// ─── TUILES XYZ ────────────────────────────────────────────────────
+function lon2x(lon,z){ return Math.floor((lon+180)/360*2**z); }
+function lat2y(lat,z){ return Math.floor((1-Math.log(Math.tan(lat*Math.PI/180)+1/Math.cos(lat*Math.PI/180))/Math.PI)/2*2**z); }
 
-function updateBboxDisplay() {
-  const b = state.bbox;
-  $('cLonMin').textContent = b ? fmt4(b.minLon) : '—';
-  $('cLonMax').textContent = b ? fmt4(b.maxLon) : '—';
-  $('cLatMin').textContent = b ? fmt4(b.minLat) : '—';
-  $('cLatMax').textContent = b ? fmt4(b.maxLat) : '—';
+function bboxTiles(bbox,z){
+  const x0=lon2x(bbox.minLon,z), x1=lon2x(bbox.maxLon,z);
+  const y0=lat2y(bbox.maxLat,z), y1=lat2y(bbox.minLat,z);
+  const list=[];
+  for(let x=x0;x<=x1;x++) for(let y=y0;y<=y1;y++) list.push({z,x,y});
+  return list;
 }
 
-function enableStep2() {
-  $('btnClear').disabled   = false;
-  $('btnProcess').disabled = false;
-  $('step2title').classList.remove('inactive');
-  $('step3title').classList.remove('inactive');
-}
-function disableStep2() {
-  $('btnClear').disabled   = true;
-  $('btnProcess').disabled = true;
-  $('step2title').classList.add('inactive');
-  $('step3title').classList.add('inactive');
+// bbox WGS84 d'une tuile XYZ
+function tileBbox(x,y,z){
+  function tile2lon(x,z){ return x/2**z*360-180; }
+  function tile2lat(y,z){ const n=Math.PI-2*Math.PI*y/2**z; return 180/Math.PI*Math.atan(0.5*(Math.exp(n)-Math.exp(-n))); }
+  return { minLon:tile2lon(x,z),   minLat:tile2lat(y+1,z),
+           maxLon:tile2lon(x+1,z), maxLat:tile2lat(y,z) };
 }
 
-$('btnClear').addEventListener('click', () => {
-  drawnItems.clearLayers();
-  if (estranLayer) { map.removeLayer(estranLayer); estranLayer = null; }
-  orthoLayer.remove();
-  state.bbox = null; state.estranPoly = null; state.mbtData = null;
-  downloadZone.classList.remove('visible');
-  updateBboxDisplay();
-  disableStep2();
-  setProgress('En attente', 0);
-  setStatus('idle');
-  log('Zone effacée.', 'warn');
-});
-
-// ─── WMTS TILE XYZ ────────────────────────────────────────────────
-function lon2tile(lon, z) { return Math.floor((lon + 180) / 360 * Math.pow(2, z)); }
-function lat2tile(lat, z) { return Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, z)); }
-
-function bboxToTiles(bbox, z) {
-  const xMin = lon2tile(bbox.minLon, z);
-  const xMax = lon2tile(bbox.maxLon, z);
-  const yMin = lat2tile(bbox.maxLat, z); // lat inversée
-  const yMax = lat2tile(bbox.minLat, z);
-  const tiles = [];
-  for (let x = xMin; x <= xMax; x++)
-    for (let y = yMin; y <= yMax; y++)
-      tiles.push({ z, x, y });
-  return tiles;
-}
-
-function tileToWGS84(x, y, z) {
-  const n = Math.PI - 2 * Math.PI * y / Math.pow(2, z);
-  return {
-    lon: x / Math.pow(2, z) * 360 - 180,
-    lat: 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n))),
-  };
-}
-
-// ─── FETCH AVEC ABORT ─────────────────────────────────────────────
-async function fetchAb(url, opts = {}) {
-  if (!state.abortCtrl || state.abortCtrl.signal.aborted) throw new Error('Annulé');
-  opts.signal = state.abortCtrl.signal;
-  const r = await fetch(url, opts);
-  if (!r.ok) throw new Error(`HTTP ${r.status} : ${url.substring(0,80)}`);
+// ─── FETCH AVEC ABORT ──────────────────────────────────────────────
+async function get(url){
+  if(!S.abort||S.abort.signal.aborted) throw new Error('Annulé');
+  const r = await fetch(url,{signal:S.abort.signal});
+  if(!r.ok) throw new Error(`HTTP ${r.status} — ${url.slice(0,90)}`);
   return r;
 }
 
-// ─── IGN API REST ALTIMÉTRIQUE — RGE Alti ─────────────────────────
-// Remplace l'ancien WCS (404). L'API retourne l'altitude de points discrets.
-// On échantillonne une grille régulière sur la bbox, par lots de 40 points.
-async function fetchMNT(bbox, res, onProgress) {
-  // Résolution en degrés (approx, latitude moyenne)
-  const latMid  = (bbox.minLat + bbox.maxLat) / 2;
-  const mPerDegLon = 111320 * Math.cos(latMid * Math.PI / 180);
-  const mPerDegLat = 111320;
-  const stepLon = res / mPerDegLon;
-  const stepLat = res / mPerDegLat;
+// ─── MNT IGN REST ──────────────────────────────────────────────────
+async function fetchMNT(bbox, res){
+  const latMid = (bbox.minLat+bbox.maxLat)/2;
+  const dLon   = res / (111320*Math.cos(latMid*Math.PI/180));
+  const dLat   = res / 111320;
+  const MAXDIM = 80;  // 80×80 = 6400 pts = 160 req → ~40s
+  const cols   = Math.min(MAXDIM, Math.ceil((bbox.maxLon-bbox.minLon)/dLon));
+  const rows   = Math.min(MAXDIM, Math.ceil((bbox.maxLat-bbox.minLat)/dLat));
+  const sLon   = (bbox.maxLon-bbox.minLon)/(cols-1||1);
+  const sLat   = (bbox.maxLat-bbox.minLat)/(rows-1||1);
 
-  // Limiter la grille à 100×100 = 10 000 points max (évite trop de requêtes)
-  const maxCols = 100, maxRows = 100;
-  const rawCols = Math.ceil((bbox.maxLon - bbox.minLon) / stepLon);
-  const rawRows = Math.ceil((bbox.maxLat - bbox.minLat) / stepLat);
-  const cols = Math.min(rawCols, maxCols);
-  const rows = Math.min(rawRows, maxRows);
-  const actualStepLon = (bbox.maxLon - bbox.minLon) / (cols - 1 || 1);
-  const actualStepLat = (bbox.maxLat - bbox.minLat) / (rows - 1 || 1);
-
-  log(`Grille MNT : ${cols} × ${rows} = ${cols*rows} points (résolution ~${res} m)`, 'info');
-
-  // Construire la liste de tous les points
-  const allLons = [], allLats = [];
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      allLons.push(bbox.minLon + c * actualStepLon);
-      allLats.push(bbox.maxLat - r * actualStepLat); // lat décroissante (ligne 0 = nord)
+  // Construire liste de points
+  const lons=[],lats=[];
+  for(let r=0;r<rows;r++)
+    for(let c=0;c<cols;c++){
+      lons.push(bbox.minLon+c*sLon);
+      lats.push(bbox.maxLat-r*sLat);  // ligne 0 = nord
     }
-  }
 
-  const total = allLons.length;
+  const total = lons.length;
+  const nReq  = Math.ceil(total/ALTI_BATCH);
+  log(`Grille MNT ${cols}×${rows} = ${total} pts (${nReq} requêtes IGN)…`,'info');
+
   const grid = new Float32Array(total).fill(NaN);
 
-  log(`Interrogation API altimétrique IGN (${Math.ceil(total/ALTI_BATCH_SIZE)} requêtes)…`, 'info');
-
-  for (let i = 0; i < total; i += ALTI_BATCH_SIZE) {
-    if (state.abortCtrl?.signal.aborted) throw new Error('Annulé');
-
-    const bLons = allLons.slice(i, i + ALTI_BATCH_SIZE);
-    const bLats = allLats.slice(i, i + ALTI_BATCH_SIZE);
-
-    const url = IGN_ALTI_URL + '?' + new URLSearchParams({
-      lon:      bLons.map(v => v.toFixed(6)).join('|'),
-      lat:      bLats.map(v => v.toFixed(6)).join('|'),
+  for(let i=0;i<total;i+=ALTI_BATCH){
+    if(S.abort?.signal.aborted) throw new Error('Annulé');
+    const bLons = lons.slice(i,i+ALTI_BATCH);
+    const bLats = lats.slice(i,i+ALTI_BATCH);
+    const url   = IGN_ALTI_URL+'?'+new URLSearchParams({
+      lon:      bLons.map(v=>v.toFixed(6)).join('|'),
+      lat:      bLats.map(v=>v.toFixed(6)).join('|'),
       resource: IGN_ALTI_RES,
-      delimiter: '|',
-      indent:   'false',
-      measures: 'false',
-      zonly:    'false',
+      delimiter:'|', indent:'false', measures:'false', zonly:'false',
     });
-
-    const r = await fetchAb(url);
-    const data = await r.json();
-    const elevs = data.elevations || [];
-    for (let j = 0; j < elevs.length; j++) {
-      const z = elevs[j].z;
-      // IGN nodata exact = -99999 (ne pas confondre avec altitudes marines négatives légitimes)
-      grid[i + j] = (z === null || z === undefined || z <= -99990) ? NaN : z;
+    try {
+      const resp = await get(url);
+      const data = await resp.json();
+      (data.elevations||[]).forEach((e,j)=>{
+        const z = e.z;
+        // IGN nodata = -99999 ; valeurs marines négatives légitimes sont conservées
+        grid[i+j] = (z==null||z<=-99990) ? NaN : z;
+      });
+    } catch(e) {
+      if(e.message==='Annulé') throw e;
+      log(`Req altimétrie ${Math.floor(i/ALTI_BATCH)+1}/${nReq} échouée : ${e.message}`,'warn');
     }
-
-    if (onProgress) onProgress(Math.min(i + ALTI_BATCH_SIZE, total), total);
-
-    // Respecter la limite de taux (5 req/s)
-    if (i + ALTI_BATCH_SIZE < total) {
-      await new Promise(res => setTimeout(res, ALTI_DELAY_MS));
-    }
+    const pct = 5+25*(i+ALTI_BATCH)/total;
+    await prog(`Altimétrie ${Math.min(i+ALTI_BATCH,total)}/${total} pts`, pct);
+    if(i+ALTI_BATCH<total) await new Promise(r=>setTimeout(r,ALTI_DELAY));
   }
 
-  // Statistiques
-  let vmin=Infinity, vmax=-Infinity, cnt=0;
-  for (let i=0; i<grid.length; i++) {
-    if (!isNaN(grid[i])) { if(grid[i]<vmin)vmin=grid[i]; if(grid[i]>vmax)vmax=grid[i]; cnt++; }
-  }
-  log(`Grille MNT reçue : ${cnt}/${total} points valides, alt. ${vmin.toFixed(2)}–${vmax.toFixed(2)} m`, 'ok');
+  // Stats
+  let vmin=Infinity,vmax=-Infinity,cnt=0;
+  for(const v of grid) if(!isNaN(v)){if(v<vmin)vmin=v;if(v>vmax)vmax=v;cnt++;}
+  log(`MNT : ${cnt}/${total} pts valides — alt. ${isFinite(vmin)?vmin.toFixed(2):'?'} / ${isFinite(vmax)?vmax.toFixed(2):'?'} m NGF`,'ok');
 
-  return { grid, width: cols, height: rows, bbox };
+  return {grid,cols,rows,bbox};
 }
 
-// ─── CONSTRUCTION POLYGONE ESTRAN ─────────────────────────────────
-// Méthode : masque raster binaire → marching squares → anneaux WGS84
-function buildEstranPolygon(grid, width, height, bbox, pbmeAlt, pmveAlt) {
-  log(`Extraction masque estran [${pbmeAlt} – ${pmveAlt} m NGF]…`, 'info');
-  const estranMask = buildEstranMask(grid, width, height, bbox, pbmeAlt, pmveAlt);
-  if (!estranMask) return null;
-  log('Nettoyage géométrique (suppression îlots < ' + MIN_AREA_M2 + ' m²)…', 'info');
-  return cleanPolygon(estranMask);
-}
+// ─── MASQUE ESTRAN (raster → vecteur) ──────────────────────────────
+// 1) Masque binaire : 1 si pbme <= z <= pmve, OU si NaN entouré de 1 (bord de mer)
+// 2) Marching squares sur ce masque
+// 3) Assemblage en anneaux
+// 4) GeoJSON + nettoyage
 
-function buildEstranMask(grid, width, height, bbox, pbmeAlt, pmveAlt) {
-  // Approche raster : on crée un masque binaire (1 = estran, 0 = hors estran)
-  // puis on extrait le contour par marching squares sur ce masque.
-
-  // Masque binaire : 1 si pbmeAlt <= z <= pmveAlt
-  const mask = new Uint8Array(width * height);
-  let cellCount = 0;
-  for (let i = 0; i < grid.length; i++) {
-    const v = grid[i];
-    if (!isNaN(v) && v >= pbmeAlt && v <= pmveAlt) { mask[i] = 1; cellCount++; }
+function buildMask(grid, cols, rows, pbme, pmve){
+  // Passe 1 : masque strict
+  const mask = new Uint8Array(cols*rows);
+  for(let i=0;i<grid.length;i++){
+    const v=grid[i];
+    if(!isNaN(v) && v>=pbme && v<=pmve) mask[i]=1;
   }
 
-  log(`${cellCount} cellules estran identifiées (masque raster)…`, 'info');
-  if (cellCount === 0) return null;
+  // Passe 2 : combler les NaN entourés de cellules estran (lacunes de couverture)
+  // Un NaN en bordure de mer doit rejoindre l'estran si ses voisins valides sont ≤ pbme
+  // (indique qu'on est côté mer ouverte = inclure dans l'estran)
+  for(let r=1;r<rows-1;r++){
+    for(let c=1;c<cols-1;c++){
+      const i=r*cols+c;
+      if(!isNaN(grid[i])) continue; // pas un NaN
+      // Voisins
+      const v=[grid[i-1],grid[i+1],grid[i-cols],grid[i+cols]].filter(x=>!isNaN(x));
+      if(v.length===0) continue;
+      // Si tous les voisins valides sont sous pbme (mer) → c'est de la mer, inclure
+      if(v.every(x=>x<=pbme)) mask[i]=1;
+    }
+  }
 
-  // Extraction de contour par marching squares sur le masque binaire
-  // On traite le masque comme une image scalaire avec isoValeur 0.5
-  const segments = [];
-  for (let row = 0; row < height - 1; row++) {
-    for (let col = 0; col < width - 1; col++) {
-      const tl = mask[row * width + col];
-      const tr = mask[row * width + col + 1];
-      const bl = mask[(row+1) * width + col];
-      const br = mask[(row+1) * width + col + 1];
-      const idx = (tl<<3)|(tr<<2)|(br<<1)|bl;
-      if (idx === 0 || idx === 15) continue;
+  return mask;
+}
 
-      // Points interpolés sur les 4 bords de la cellule (en coordonnées pixel)
-      const top    = [col + 0.5, row];
-      const bot    = [col + 0.5, row + 1];
-      const left   = [col,       row + 0.5];
-      const right  = [col + 1,   row + 0.5];
-
-      const table = {
-        1:  [[left, bot]],
-        2:  [[bot, right]],
-        3:  [[left, right]],
-        4:  [[top, right]],
-        5:  [[top, left], [bot, right]],   // selle
-        6:  [[top, bot]],
-        7:  [[top, left]],
-        8:  [[top, left]],
-        9:  [[top, bot]],
-        10: [[top, right], [bot, left]],   // selle
-        11: [[top, right]],
-        12: [[left, right]],
-        13: [[bot, right]],
-        14: [[left, bot]],
+function maskToGeoJSON(mask, cols, rows, bbox, pbme, pmve){
+  // Marching squares sur le masque binaire
+  const segs=[];
+  for(let r=0;r<rows-1;r++){
+    for(let c=0;c<cols-1;c++){
+      const tl=mask[r*cols+c], tr=mask[r*cols+c+1];
+      const bl=mask[(r+1)*cols+c], br=mask[(r+1)*cols+c+1];
+      const idx=(tl<<3)|(tr<<2)|(br<<1)|bl;
+      if(idx===0||idx===15) continue;
+      const T=[c+.5,r], B=[c+.5,r+1], L=[c,r+.5], R=[c+1,r+.5];
+      const tbl={
+        1:[[L,B]], 2:[[B,R]], 3:[[L,R]], 4:[[T,R]],
+        5:[[T,R],[B,L]], 6:[[T,B]], 7:[[T,L]],
+        8:[[T,L]], 9:[[T,B]], 10:[[T,L],[B,R]],
+        11:[[T,R]], 12:[[L,R]], 13:[[B,R]], 14:[[L,B]],
       };
-      for (const seg of (table[idx] || [])) segments.push(seg);
+      for(const s of (tbl[idx]||[])) segs.push(s);
     }
   }
+  if(segs.length===0) return null;
 
-  if (segments.length === 0) return null;
+  // px → WGS84
+  const cW=(bbox.maxLon-bbox.minLon)/cols;
+  const cH=(bbox.maxLat-bbox.minLat)/rows;
+  const p2w=([px,py])=>[bbox.minLon+px*cW, bbox.maxLat-py*cH];
+  const wsegs=segs.map(([a,b])=>[p2w(a),p2w(b)]);
 
-  // Convertir pixel → WGS84
-  const cellW = (bbox.maxLon - bbox.minLon) / width;
-  const cellH = (bbox.maxLat - bbox.minLat) / height;
-  function px2wgs([px, py]) {
-    return [bbox.minLon + px * cellW, bbox.maxLat - py * cellH];
-  }
-  const wgsSegs = segments.map(([a, b]) => [px2wgs(a), px2wgs(b)]);
+  // Assembler en anneaux
+  const rings=assembleRings(wsegs);
+  if(rings.length===0) return null;
+  log(`${rings.length} anneau(x) estran extraits`,'info');
 
-  // Assemblage des segments en anneaux fermés
-  const rings = assembleRings(wgsSegs);
-  if (rings.length === 0) return null;
+  const polys=rings
+    .filter(r=>r.length>=4)
+    .map(r=>{ if(r[0][0]!==r[r.length-1][0]||r[0][1]!==r[r.length-1][1]) r.push(r[0]); return r; });
+  if(polys.length===0) return null;
 
-  log(`${rings.length} anneau(x) extrait(s) du masque estran`, 'info');
+  const gj = polys.length===1
+    ? turf.polygon([polys[0]])
+    : turf.multiPolygon(polys.map(p=>[p]));
 
-  // Construire GeoJSON MultiPolygon depuis les anneaux
-  // Heuristique : anneaux > 4 points → polygone externe ; sinon trou potentiel
-  const polys = rings
-    .filter(r => r.length >= 4)
-    .map(r => {
-      // Fermer l'anneau
-      if (r[0][0] !== r[r.length-1][0] || r[0][1] !== r[r.length-1][1]) r.push(r[0]);
-      return r;
-    });
-
-  if (polys.length === 0) return null;
-  if (polys.length === 1) return turf.polygon([polys[0]]);
-  return turf.multiPolygon(polys.map(p => [p]));
+  // Simplifier + filtrer îlots
+  const simp = turf.simplify(gj,{tolerance:SIMPLIFY,highQuality:false});
+  return filterSmall(simp);
 }
 
-// Assemble des segments [[A,B], [B,C], …] en anneaux fermés
-function assembleRings(segments) {
-  if (segments.length === 0) return [];
-  const eps = 1e-8;
-  const used = new Uint8Array(segments.length);
-  const rings = [];
-
-  function ptEq(a, b) {
-    return Math.abs(a[0]-b[0]) < eps && Math.abs(a[1]-b[1]) < eps;
-  }
-
-  for (let start = 0; start < segments.length; start++) {
-    if (used[start]) continue;
-    used[start] = 1;
-    const ring = [...segments[start]];
-    let changed = true;
-    while (changed && ring[0] !== ring[ring.length-1]) {
-      changed = false;
-      const tail = ring[ring.length-1];
-      for (let j = 0; j < segments.length; j++) {
-        if (used[j]) continue;
-        if (ptEq(segments[j][0], tail)) {
-          ring.push(segments[j][1]); used[j] = 1; changed = true; break;
-        }
-        if (ptEq(segments[j][1], tail)) {
-          ring.push(segments[j][0]); used[j] = 1; changed = true; break;
-        }
+function assembleRings(segs){
+  const eps=1e-9;
+  const ptEq=([ax,ay],[bx,by])=>Math.abs(ax-bx)<eps&&Math.abs(ay-by)<eps;
+  const used=new Uint8Array(segs.length);
+  const rings=[];
+  for(let s=0;s<segs.length;s++){
+    if(used[s]) continue;
+    used[s]=1;
+    const ring=[...segs[s]];
+    let changed=true;
+    while(changed){
+      changed=false;
+      const tail=ring[ring.length-1];
+      for(let j=0;j<segs.length;j++){
+        if(used[j]) continue;
+        if(ptEq(segs[j][0],tail)){ ring.push(segs[j][1]); used[j]=1; changed=true; break; }
+        if(ptEq(segs[j][1],tail)){ ring.push(segs[j][0]); used[j]=1; changed=true; break; }
       }
     }
-    if (ring.length >= 4) rings.push(ring);
+    if(ring.length>=4) rings.push(ring);
   }
   return rings;
 }
 
-function cleanPolygon(geojson) {
-  if (!geojson) return null;
-  // Simplifier
-  const simplified = turf.simplify(geojson, { tolerance: SIMPLIFY_TOL, highQuality: false });
-  // Supprimer les petits polygones (îlots internes ou externes)
-  if (simplified.geometry.type === 'Polygon') {
-    return simplified;
+function filterSmall(gj){
+  if(!gj) return null;
+  if(gj.geometry.type==='Polygon'){
+    return turf.area(gj)>=MIN_AREA ? gj : null;
   }
-  // MultiPolygon : filtrer par aire
-  if (simplified.geometry.type === 'MultiPolygon') {
-    const kept = simplified.geometry.coordinates.filter(coords => {
-      const poly = turf.polygon(coords);
-      const area = turf.area(poly);
-      return area >= MIN_AREA_M2;
-    });
-    if (kept.length === 0) return null;
-    if (kept.length === 1) return turf.polygon(kept[0]);
+  if(gj.geometry.type==='MultiPolygon'){
+    const kept=gj.geometry.coordinates.filter(c=>turf.area(turf.polygon(c))>=MIN_AREA);
+    if(kept.length===0) return null;
+    if(kept.length===1) return turf.polygon(kept[0]);
     return turf.multiPolygon(kept);
   }
-  return simplified;
+  return gj;
 }
 
-// ─── TUILES ORTHO ─────────────────────────────────────────────────
-async function fetchOrthoTile(z, x, y) {
-  const url = IGN_WMTS_BASE +
-    `?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0` +
-    `&LAYER=${IGN_ORTHO_LAYER}&STYLE=normal&FORMAT=image/jpeg` +
+// ─── INTERSECT TUILE / POLYGONE ─────────────────────────────────────
+// On utilise une bbox check simple puis Turf, avec fallback sur bbox seule
+// pour éviter les faux-négatifs de booleanIntersects sur MultiPolygon
+function tileIntersects(tile, poly){
+  const tb = tileBbox(tile.x,tile.y,tile.z);
+  // 1. Test bbox rapide contre l'enveloppe du polygone
+  const pb = turf.bbox(poly); // [minLon,minLat,maxLon,maxLat]
+  if(tb.maxLon<pb[0]||tb.minLon>pb[2]||tb.maxLat<pb[1]||tb.minLat>pb[3]) return false;
+  // 2. Test précis
+  try{
+    const tBox = turf.bboxPolygon([tb.minLon,tb.minLat,tb.maxLon,tb.maxLat]);
+    // booleanIntersects peut rater sur MultiPolygon → on décompose
+    if(poly.geometry.type==='MultiPolygon'){
+      return poly.geometry.coordinates.some(c=>{
+        try{ return turf.booleanIntersects(turf.polygon(c), tBox); }catch{ return false; }
+      });
+    }
+    return turf.booleanIntersects(poly, tBox);
+  }catch{ return true; } // en cas d'erreur Turf, on inclut la tuile
+}
+
+// ─── ORTHO TILE FETCH ──────────────────────────────────────────────
+async function fetchTile(z,x,y){
+  const url=IGN_WMTS_BASE+
+    `?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0`+
+    `&LAYER=${IGN_ORTHO_LAYER}&STYLE=normal&FORMAT=image/jpeg`+
     `&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
-  const r = await fetchAb(url);
-  const ab = await r.arrayBuffer();
-  return new Uint8Array(ab);
+  const r=await get(url);
+  return new Uint8Array(await r.arrayBuffer());
 }
 
-// ─── MBTILES ──────────────────────────────────────────────────────
-async function buildMBTiles(tiles, estranPoly, zoom, onProgress) {
-  log('Initialisation SQLite (sql.js)…', 'info');
+// ─── MBTILES ───────────────────────────────────────────────────────
+async function buildMBTiles(tiles, zoom){
+  await prog('Initialisation SQLite…', 56);
+  log('Initialisation sql.js (SQLite WASM)…','info');
 
   const SQL = await initSqlJs({
-    locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/${f}`
+    locateFile: f=>`https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/${f}`
   });
   const db = new SQL.Database();
 
-  // Schéma MBTiles standard
-  db.run(`CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT);`);
-  db.run(`CREATE TABLE IF NOT EXISTS tiles (
-    zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER,
-    tile_data BLOB, PRIMARY KEY (zoom_level, tile_column, tile_row)
-  );`);
-  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS tile_idx
-    ON tiles (zoom_level, tile_column, tile_row);`);
+  db.run('CREATE TABLE metadata (name TEXT, value TEXT)');
+  db.run('CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB, PRIMARY KEY(zoom_level,tile_column,tile_row))');
+  db.run('CREATE UNIQUE INDEX tile_idx ON tiles(zoom_level,tile_column,tile_row)');
 
-  // Metadata
-  const meta = [
-    ['name',        'Estran IGN Platier CL'],
-    ['type',        'baselayer'],
-    ['version',     '1.0'],
-    ['description', 'Orthophotos IGN dans la zone estran'],
-    ['format',      'jpg'],
-    ['minzoom',     String(zoom)],
-    ['maxzoom',     String(zoom)],
-  ];
-  for (const [k,v] of meta) db.run('INSERT INTO metadata VALUES (?,?)', [k,v]);
+  for(const [k,v] of [
+    ['name','Estran Platier CL'],['type','baselayer'],['version','1.0'],
+    ['description','BD Ortho IGN — zone estran'],['format','jpg'],
+    ['minzoom',String(zoom)],['maxzoom',String(zoom)],
+  ]) db.run('INSERT INTO metadata VALUES(?,?)',[k,v]);
 
-  // Filtrer les tuiles intersectant le polygone estran
-  const validTiles = estranPoly
-    ? tiles.filter(t => {
-        const sw = tileToWGS84(t.x,   t.y+1, t.z);
-        const ne = tileToWGS84(t.x+1, t.y,   t.z);
-        const tileBox = turf.bboxPolygon([sw.lon, sw.lat, ne.lon, ne.lat]);
-        try { return turf.booleanIntersects(estranPoly, tileBox); }
-        catch { return true; }
-      })
-    : tiles;
+  const stmt = db.prepare('INSERT OR REPLACE INTO tiles VALUES(?,?,?,?)');
+  const total = tiles.length;
+  let done=0, errors=0;
 
-  log(`Tuiles à télécharger : ${validTiles.length} (zoom ${zoom})`, 'info');
+  for(let i=0;i<total;i+=CONCUR){
+    if(S.abort?.signal.aborted) throw new Error('Annulé');
 
-  const stmt = db.prepare(
-    'INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?,?,?,?)'
-  );
+    const batch = tiles.slice(i,i+CONCUR);
+    const res   = await Promise.allSettled(batch.map(t=>fetchTile(t.z,t.x,t.y)));
 
-  let done = 0;
-  const total = validTiles.length;
-  const CONCURRENCY = 4;
-
-  for (let i = 0; i < validTiles.length; i += CONCURRENCY) {
-    if (state.abortCtrl?.signal.aborted) throw new Error('Annulé');
-    const batch = validTiles.slice(i, i + CONCURRENCY);
-    const results = await Promise.allSettled(batch.map(t => fetchOrthoTile(t.z, t.x, t.y)));
-    for (let j = 0; j < batch.length; j++) {
-      if (results[j].status === 'fulfilled') {
-        const { z, x, y } = batch[j];
-        // MBTiles : tile_row = inversé (TMS)
-        const tmsY = Math.pow(2, z) - 1 - y;
-        stmt.run([z, x, tmsY, results[j].value]);
-        done++;
+    for(let j=0;j<batch.length;j++){
+      done++;
+      if(res[j].status==='fulfilled'){
+        const {z,x,y}=batch[j];
+        const tmsY=2**z-1-y;  // TMS = Y inversé
+        stmt.run([z,x,tmsY,res[j].value]);
       } else {
-        log(`Tuile ${batch[j].z}/${batch[j].x}/${batch[j].y} échouée`, 'warn');
-        done++;
+        errors++;
+        log(`⚠ Tuile ${batch[j].z}/${batch[j].x}/${batch[j].y} : ${res[j].reason?.message||'erreur'}`,'warn');
       }
     }
-    onProgress(done, total);
+
+    const pct = 58+40*(done/total);
+    await prog(`Tuiles ortho : ${done}/${total}  (${errors} erreur(s))`, pct);
   }
 
   stmt.free();
-  log('Export SQLite en cours…', 'info');
-  let data;
-  try {
-    data = db.export(); // Uint8Array
-  } catch(e) {
-    db.close();
-    throw new Error('Échec export SQLite : ' + e.message);
-  }
+  log('Export SQLite…','info');
+  await prog('Export SQLite…', 99);
+  const data = db.export();
   db.close();
-  if (!data || data.byteLength === 0) throw new Error('Export SQLite vide — aucune tuile insérée ?');
-  log(`SQLite exporté : ${(data.byteLength/1024).toFixed(0)} Ko`, 'ok');
+
+  if(!data||data.byteLength<4096) throw new Error('Fichier SQLite trop petit — aucune tuile insérée ?');
   return data;
 }
 
-// ─── PIPELINE PRINCIPAL ───────────────────────────────────────────
-async function runPipeline() {
-  if (!state.bbox) { log('Aucune zone sélectionnée.', 'warn'); return; }
+// ─── TÉLÉCHARGEMENT ────────────────────────────────────────────────
+function download(data){
+  try{
+    const blob = new Blob([data.buffer], {type:'application/x-sqlite3'});
+    const url  = URL.createObjectURL(blob);
+    const a    = Object.assign(document.createElement('a'),{href:url,download:'estran.mbtiles'});
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url),15000);
+    log('Téléchargement déclenché : estran.mbtiles','ok');
+  }catch(e){ log('Erreur téléchargement : '+e.message,'err'); }
+}
 
-  state.t0 = Date.now();
-  state.abortCtrl = new AbortController();
+$('btnDownload').addEventListener('click',()=>{
+  if(S.mbt) download(S.mbt);
+  else log('Aucun fichier disponible.','warn');
+});
 
-  $('btnProcess').disabled = true;
-  $('btnAbort').disabled   = false;
-  downloadZone.classList.remove('visible');
-  setStatus('running');
+// ─── PIPELINE ──────────────────────────────────────────────────────
+async function run(){
+  if(!S.bbox){ log('Aucune zone sélectionnée.','warn'); return; }
 
-  const bbox    = state.bbox;
-  const pbmeAlt = isNaN(parseFloat($('pbmeAlt').value)) ? -3.0 : parseFloat($('pbmeAlt').value);
-  const pmveAlt = isNaN(parseFloat($('pmveAlt').value)) ?  5.0 : parseFloat($('pmveAlt').value);
-  const res     = parseInt($('mntRes').value) || 5;
-  const zoom    = parseInt($('orthoZoom').value) || 18;
+  S.t0=Date.now(); S.abort=new AbortController();
+  $('btnProcess').disabled=true;
+  $('btnAbort').disabled=false;
+  dlZone.classList.remove('visible');
+  status('run');
 
-  log(`Paramètres : altitude basse=${pbmeAlt} m, PMVE=${pmveAlt} m, résolution=${res} m, zoom=${zoom}`, 'info');
+  const pbme = isNaN(parseFloat($('pbmeAlt').value)) ? -3.0 : parseFloat($('pbmeAlt').value);
+  const pmve = isNaN(parseFloat($('pmveAlt').value)) ?  5.0 : parseFloat($('pmveAlt').value);
+  const res  = parseInt($('mntRes').value)   || 5;
+  const zoom = parseInt($('orthoZoom').value)|| 18;
 
-  try {
-    // ── ÉTAPE 1 : MNT via API REST IGN altimétrique ───────────────
-    setProgress('Téléchargement altimétrie IGN RGE Alti…', 5);
-    log('Téléchargement MNT IGN via API REST altimétrique…', 'info');
-    const { grid, width, height } = await fetchMNT(bbox, res, (done, total) => {
-      const pct = 5 + 25 * (done / total);
-      setProgress(`Altimétrie : ${done}/${total} points`, pct);
-    });
+  log(`▶ Démarrage — basse=${pbme}m, PMVE=${pmve}m, résol=${res}m, zoom=${zoom}`,'info');
 
-    if (grid.every(v => isNaN(v))) {
-      throw new Error('Aucune donnée altimétrique reçue — vérifiez la zone sélectionnée.');
-    }
+  try{
+    // ── 1. MNT altimétrique ──────────────────────────────────────
+    await prog('Téléchargement altimétrie IGN…', 5);
+    const {grid,cols,rows,bbox} = await fetchMNT(S.bbox, res);
 
-    // Vérification de la plage altitudinale
-    let vmin=Infinity, vmax=-Infinity;
-    for (let i=0; i<grid.length; i++) {
-      if (!isNaN(grid[i])) { if(grid[i]<vmin)vmin=grid[i]; if(grid[i]>vmax)vmax=grid[i]; }
-    }
-    log(`Alt. min/max grille : ${vmin.toFixed(2)} – ${vmax.toFixed(2)} m NGF`, 'info');
-    if (vmax < pbmeAlt || vmin > pmveAlt) {
-      log(`⚠ La plage altitudinale de la zone [${vmin.toFixed(1)}, ${vmax.toFixed(1)}] ne recoupe pas l'estran [${pbmeAlt}, ${pmveAlt}]`, 'warn');
-    }
+    // ── 2. Masque estran ─────────────────────────────────────────
+    await prog('Construction masque estran…', 32);
+    log(`Masque estran [${pbme} m – ${pmve} m NGF]…`,'info');
+    const mask = buildMask(grid, cols, rows, pbme, pmve);
+    const nCells = mask.reduce((a,v)=>a+v,0);
+    log(`${nCells}/${cols*rows} cellules dans la plage estran`,'info');
 
-    // ── ÉTAPE 2 : Polygone estran ──────────────────────────────────
-    setProgress('Construction du polygone estran…', 35);
-    const estranPoly = buildEstranPolygon(grid, width, height, bbox, pbmeAlt, pmveAlt);
+    if(nCells===0) throw new Error(
+      `Aucune cellule estran trouvée entre ${pbme} m et ${pmve} m NGF. `+
+      `Vérifiez les altitudes et la zone (elle doit être littorale).`
+    );
 
-    if (estranPoly) {
-      state.estranPoly = estranPoly;
-      if (estranLayer) map.removeLayer(estranLayer);
-      estranLayer = L.geoJSON(estranPoly, {
-        style: { color: '#00c8a0', weight: 2, fillColor: '#00c8a0', fillOpacity: 0.25 }
-      }).addTo(map);
-      const aireHa = (turf.area(estranPoly) / 10000).toFixed(1);
-      log(`Polygone estran : ${aireHa} ha — affiché sur la carte.`, 'ok');
+    // ── 3. Polygone vectoriel ────────────────────────────────────
+    await prog('Vectorisation du masque…', 38);
+    log('Vectorisation + nettoyage…','info');
+    const poly = maskToGeoJSON(mask, cols, rows, bbox, pbme, pmve);
+
+    if(!poly) throw new Error('Impossible de construire le polygone estran — essayez une zone plus grande ou des altitudes différentes.');
+
+    S.poly = poly;
+    const ha = (turf.area(poly)/10000).toFixed(1);
+    log(`Polygone estran : ${ha} ha`,'ok');
+
+    if(estranLyr) map.removeLayer(estranLyr);
+    estranLyr = L.geoJSON(poly,{
+      style:{color:'#00c8a0',weight:2,fillColor:'#00c8a0',fillOpacity:0.22}
+    }).addTo(map);
+
+    // ── 4. Sélection tuiles ──────────────────────────────────────
+    await prog('Sélection des tuiles ortho…', 45);
+    const allTiles = bboxTiles(bbox, zoom);
+    log(`Tuiles bbox zoom ${zoom} : ${allTiles.length} — filtrage sur estran…`,'info');
+
+    const selTiles = allTiles.filter(t => tileIntersects(t, poly));
+    log(`Tuiles retenues : ${selTiles.length} / ${allTiles.length}`,'ok');
+
+    if(selTiles.length===0) throw new Error('Aucune tuile ne couvre le polygone estran.');
+    if(selTiles.length>4000) log(`⚠ ${selTiles.length} tuiles : opération longue, soyez patient.`,'warn');
+
+    // ── 5. MBTiles ───────────────────────────────────────────────
+    await prog('Démarrage assemblage MBTiles…', 55);
+    const mbt = await buildMBTiles(selTiles, zoom);
+    S.mbt = mbt;
+
+    const sz = mbt.byteLength>1048576
+      ? `${(mbt.byteLength/1048576).toFixed(2)} Mo`
+      : `${(mbt.byteLength/1024).toFixed(0)} Ko`;
+    log(`MBTiles : ${sz} — ${selTiles.length} tuiles zoom ${zoom}`,'ok');
+
+    // ── 6. Téléchargement auto ───────────────────────────────────
+    await prog('Téléchargement…', 99);
+    download(mbt);
+    await prog('✓ Terminé', 100);
+    status('done');
+
+    $('mbtSize').textContent = sz;
+    dlZone.classList.add('visible');
+    log('✓ Pipeline terminé.','ok');
+
+  }catch(e){
+    if(e.name==='AbortError'||e.message==='Annulé'){
+      log('Annulé.','warn'); status('idle'); await prog('Annulé',0);
     } else {
-      throw new Error(
-        `Aucun estran détecté entre ${pbmeAlt} m et ${pmveAlt} m NGF. ` +
-        `Ajustez les altitudes basse/haute ou vérifiez que la zone est bien littorale.`
-      );
-    }
-
-    // ── ÉTAPE 3 : Tuiles ortho ────────────────────────────────────
-    setProgress('Calcul des tuiles WMTS…', 50);
-    // On calcule d'abord toutes les tuiles de la bbox, puis on filtre sur l'estran
-    const allTiles = bboxToTiles(bbox, zoom);
-    log(`Tuiles bbox totales zoom ${zoom} : ${allTiles.length}`, 'info');
-
-    // Filtrage strict sur le polygone estran
-    const tiles = allTiles.filter(t => {
-      const sw = tileToWGS84(t.x,   t.y+1, t.z);
-      const ne = tileToWGS84(t.x+1, t.y,   t.z);
-      const tileBox = turf.bboxPolygon([sw.lon, sw.lat, ne.lon, ne.lat]);
-      try { return turf.booleanIntersects(estranPoly, tileBox); }
-      catch { return false; }
-    });
-    log(`Tuiles intersectant l'estran : ${tiles.length} (sur ${allTiles.length} dans la bbox)`, 'ok');
-
-    if (tiles.length === 0) {
-      throw new Error('Aucune tuile ortho ne recouvre le polygone estran — bbox trop petite ?');
-    }
-    if (tiles.length > 3000) {
-      log(`⚠ ${tiles.length} tuiles — résolution trop élevée pour cette surface. Réduisez le zoom ou la zone.`, 'warn');
-    }
-
-    // ── ÉTAPE 4 : MBTiles ─────────────────────────────────────────
-    setProgress('Assemblage MBTiles…', 55);
-    log('Assemblage MBTiles (tuiles estran uniquement)…', 'info');
-
-    // On passe null comme estranPoly à buildMBTiles car le filtre est déjà fait ci-dessus
-    const mbtData = await buildMBTiles(tiles, null, zoom, (done, total) => {
-      const pct = 55 + 40 * (done / total);
-      setProgress(`Tuiles : ${done}/${total}`, pct);
-    });
-
-    state.mbtData = mbtData;
-    const bytes  = mbtData.byteLength;
-    const sizeTxt = bytes > 1024*1024
-      ? `${(bytes/1024/1024).toFixed(2)} Mo`
-      : `${(bytes/1024).toFixed(1)} Ko`;
-
-    // ── ÉTAPE 5 : Téléchargement ──────────────────────────────────
-    setProgress('Téléchargement…', 98);
-    log(`MBTiles prêt : ${sizeTxt} — déclenchement du téléchargement…`, 'ok');
-
-    // Déclencher immédiatement le téléchargement
-    triggerDownload(mbtData);
-
-    setProgress('Terminé !', 100);
-    setStatus('done');
-    $('mbtSize').textContent = sizeTxt;
-    downloadZone.classList.add('visible');
-    log('Pipeline terminé. Fichier estran.mbtiles téléchargé.', 'ok');
-
-  } catch(err) {
-    if (err.name === 'AbortError' || err.message === 'Annulé') {
-      log('Traitement annulé.', 'warn');
-      setStatus('idle');
-      setProgress('Annulé', 0);
-    } else {
-      const msg = err.message || String(err);
-      log(`ERREUR : ${msg}`, 'err');
-      if (err.stack) console.error('[Platier] Pipeline error:', err.stack);
-      setStatus('error');
-      setProgress('Erreur — voir le log', 0);
+      log('ERREUR : '+e.message,'err');
+      console.error(e);
+      status('err'); await prog('Erreur',0);
     }
   } finally {
-    $('btnProcess').disabled = false;
-    $('btnAbort').disabled   = true;
-    state.abortCtrl = null;
+    $('btnProcess').disabled=false;
+    $('btnAbort').disabled=true;
+    S.abort=null;
   }
 }
 
-// ─── TÉLÉCHARGEMENT ───────────────────────────────────────────────
-function triggerDownload(data) {
-  try {
-    const blob = new Blob([data.buffer || data], { type: 'application/x-sqlite3' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    a.download = 'estran.mbtiles';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
-    log('Téléchargement démarré : estran.mbtiles', 'ok');
-  } catch(e) {
-    log('Erreur lors du téléchargement : ' + e.message, 'err');
-  }
-}
-
-$('btnDownload').addEventListener('click', () => {
-  if (!state.mbtData) { log('Aucun fichier disponible.', 'warn'); return; }
-  triggerDownload(state.mbtData);
+$('btnProcess').addEventListener('click', run);
+$('btnAbort').addEventListener('click', ()=>{
+  if(S.abort){ S.abort.abort(); log('Annulation demandée…','warn'); }
 });
 
-$('btnProcess').addEventListener('click', runPipeline);
-
-$('btnAbort').addEventListener('click', () => {
-  if (state.abortCtrl) { state.abortCtrl.abort(); log('Annulation demandée…', 'warn'); }
-});
-
-// ─── CURSOR COORDS ────────────────────────────────────────────────
-const mapInfo = $('mapInfo');
-map.on('mousemove', e => {
-  mapInfo.style.display = 'block';
-  mapInfo.textContent = `${e.latlng.lng.toFixed(5)}°E  ${e.latlng.lat.toFixed(5)}°N`;
-});
-map.on('mouseout', () => { mapInfo.style.display = 'none'; });
-
-log('Platier CL prêt. Dessinez un rectangle pour commencer.', 'ok');
+log('Platier CL prêt. Dessinez un rectangle sur la carte.','ok');

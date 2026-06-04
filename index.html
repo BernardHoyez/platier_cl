@@ -413,7 +413,7 @@
 </div>
 <script>
 // Détection mise à jour SW + cache-buster
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.6.0';
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js').then(reg => {
     reg.addEventListener('updatefound', () => {
@@ -431,6 +431,6 @@ if ('serviceWorker' in navigator) {
   });
 }
 </script>
-<script src="app.js?v=1.5.0"></script>
+<script src="app.js?v=1.6.0"></script>
 </body>
 </html>
