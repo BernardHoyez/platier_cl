@@ -4,7 +4,7 @@
    la mise à jour de tous les clients.
    ═══════════════════════════════════════════════════════════════ */
 
-const CACHE_VERSION = 'platier-v1.3.0';
+const CACHE_VERSION = 'platier-v1.4.0';
 
 // Ressources à mettre en cache lors de l'installation
 const PRECACHE = [

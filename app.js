@@ -276,25 +276,24 @@ async function fetchMNT(bbox, res, onProgress) {
 
 // ─── CONSTRUCTION POLYGONE ESTRAN ─────────────────────────────────
 // Méthode : masque raster binaire → marching squares → anneaux WGS84
-function buildEstranPolygon(grid, width, height, bbox, pmveAlt) {
-  log(`Extraction masque estran [0 – ${pmveAlt} m NGF]…`, 'info');
-  const estranMask = buildEstranMask(grid, width, height, bbox, pmveAlt);
+function buildEstranPolygon(grid, width, height, bbox, pbmeAlt, pmveAlt) {
+  log(`Extraction masque estran [${pbmeAlt} – ${pmveAlt} m NGF]…`, 'info');
+  const estranMask = buildEstranMask(grid, width, height, bbox, pbmeAlt, pmveAlt);
   if (!estranMask) return null;
   log('Nettoyage géométrique (suppression îlots < ' + MIN_AREA_M2 + ' m²)…', 'info');
   return cleanPolygon(estranMask);
 }
 
-function buildEstranMask(grid, width, height, bbox, pmveAlt) {
+function buildEstranMask(grid, width, height, bbox, pbmeAlt, pmveAlt) {
   // Approche raster : on crée un masque binaire (1 = estran, 0 = hors estran)
   // puis on extrait le contour par marching squares sur ce masque.
-  // Beaucoup plus rapide et fiable que l'union Turf cellule par cellule.
 
-  // Masque binaire : 1 si 0 <= z <= pmveAlt, 0 sinon
+  // Masque binaire : 1 si pbmeAlt <= z <= pmveAlt
   const mask = new Uint8Array(width * height);
   let cellCount = 0;
   for (let i = 0; i < grid.length; i++) {
     const v = grid[i];
-    if (!isNaN(v) && v >= 0 && v <= pmveAlt) { mask[i] = 1; cellCount++; }
+    if (!isNaN(v) && v >= pbmeAlt && v <= pmveAlt) { mask[i] = 1; cellCount++; }
   }
 
   log(`${cellCount} cellules estran identifiées (masque raster)…`, 'info');
@@ -525,7 +524,8 @@ async function runPipeline() {
   setStatus('running');
 
   const bbox    = state.bbox;
-  const pmveAlt = parseFloat($('pmveAlt').value) || 5.0;
+  const pbmeAlt = parseFloat($('pbmeAlt').value);   // altitude basse (zéro hydro, négatif)
+  const pmveAlt = parseFloat($('pmveAlt').value) || 5.0; // altitude haute (PMVE)
   const res     = parseInt($('mntRes').value) || 5;
   const zoom    = parseInt($('orthoZoom').value) || 17;
 
@@ -547,13 +547,14 @@ async function runPipeline() {
     for (let i=0; i<grid.length; i++) {
       if (!isNaN(grid[i])) { if(grid[i]<vmin)vmin=grid[i]; if(grid[i]>vmax)vmax=grid[i]; }
     }
-    if (vmax < 0 || vmin > pmveAlt) {
-      log(`⚠ La zone ne semble pas comporter d'estran (altitude hors [0, ${pmveAlt}])`, 'warn');
+    log(`Alt. min/max grille : ${vmin.toFixed(2)} – ${vmax.toFixed(2)} m NGF`, 'info');
+    if (vmax < pbmeAlt || vmin > pmveAlt) {
+      log(`⚠ La plage altitudinale de la zone [${vmin.toFixed(1)}, ${vmax.toFixed(1)}] ne recoupe pas l'estran [${pbmeAlt}, ${pmveAlt}]`, 'warn');
     }
 
     // ── ÉTAPE 2 : Polygone estran ──────────────────────────────────
     setProgress('Construction du polygone estran…', 35);
-    const estranPoly = buildEstranPolygon(grid, width, height, bbox, pmveAlt);
+    const estranPoly = buildEstranPolygon(grid, width, height, bbox, pbmeAlt, pmveAlt);
 
     if (estranPoly) {
       state.estranPoly = estranPoly;
@@ -564,10 +565,9 @@ async function runPipeline() {
       const aireHa = (turf.area(estranPoly) / 10000).toFixed(1);
       log(`Polygone estran : ${aireHa} ha — affiché sur la carte.`, 'ok');
     } else {
-      // Pas d'estran détecté → bloquer plutôt que télécharger toute la bbox
       throw new Error(
-        `Aucun estran détecté entre 0 m et ${pmveAlt} m NGF. ` +
-        `Vérifiez la valeur PMVE (actuellement ${pmveAlt} m) et que la zone sélectionnée est bien littorale.`
+        `Aucun estran détecté entre ${pbmeAlt} m et ${pmveAlt} m NGF. ` +
+        `Ajustez les altitudes basse/haute ou vérifiez que la zone est bien littorale.`
       );
     }
 
