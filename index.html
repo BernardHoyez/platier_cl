@@ -391,6 +391,37 @@
   </aside>
 </div>
 
-<script src="app.js"></script>
+<!-- Bannière de mise à jour SW -->
+<div id="swUpdateBanner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;
+  background:#f0a500;color:#06111f;padding:8px 16px;font-size:13px;font-weight:600;
+  display:none;align-items:center;gap:12px;justify-content:center;">
+  ⚡ Nouvelle version disponible —
+  <button onclick="window.location.reload(true)"
+    style="background:#06111f;color:#f0a500;border:none;padding:4px 12px;
+    border-radius:4px;cursor:pointer;font-weight:700;">
+    Recharger maintenant
+  </button>
+</div>
+<script>
+// Détection mise à jour SW + cache-buster
+const APP_VERSION = '1.1.0';
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js').then(reg => {
+    reg.addEventListener('updatefound', () => {
+      const nw = reg.installing;
+      nw.addEventListener('statechange', () => {
+        if (nw.state === 'installed' && navigator.serviceWorker.controller) {
+          document.getElementById('swUpdateBanner').style.display = 'flex';
+        }
+      });
+    });
+  });
+  // Si le SW contrôle la page, écouter les messages de skip
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    window.location.reload();
+  });
+}
+</script>
+<script src="app.js?v=1.1.0"></script>
 </body>
 </html>

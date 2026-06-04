@@ -682,11 +682,4 @@ map.on('mousemove', e => {
 });
 map.on('mouseout', () => { mapInfo.style.display = 'none'; });
 
-// ─── SERVICE WORKER ───────────────────────────────────────────────
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('./sw.js').then(reg => {
-    console.log('[PWA] SW enregistré', reg.scope);
-  }).catch(err => console.warn('[PWA] SW erreur', err));
-}
-
 log('Platier CL prêt. Dessinez un rectangle pour commencer.', 'ok');
