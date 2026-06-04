@@ -597,30 +597,49 @@ async function runPipeline() {
 
     if (estranPoly) {
       state.estranPoly = estranPoly;
-      // Afficher sur la carte
       if (estranLayer) map.removeLayer(estranLayer);
       estranLayer = L.geoJSON(estranPoly, {
         style: { color: '#00c8a0', weight: 2, fillColor: '#00c8a0', fillOpacity: 0.25 }
       }).addTo(map);
-      log('Polygone estran construit et affiché.', 'ok');
+      const aireHa = (turf.area(estranPoly) / 10000).toFixed(1);
+      log(`Polygone estran : ${aireHa} ha — affiché sur la carte.`, 'ok');
     } else {
-      log('Aucun polygone estran trouvé dans la zone.', 'warn');
+      // Pas d'estran détecté → bloquer plutôt que télécharger toute la bbox
+      throw new Error(
+        `Aucun estran détecté entre 0 m et ${pmveAlt} m NGF. ` +
+        `Vérifiez la valeur PMVE (actuellement ${pmveAlt} m) et que la zone sélectionnée est bien littorale.`
+      );
     }
 
     // ── ÉTAPE 3 : Tuiles ortho ────────────────────────────────────
     setProgress('Calcul des tuiles WMTS…', 50);
-    const tiles = bboxToTiles(bbox, zoom);
-    log(`Tuiles WMTS zoom ${zoom} dans la bbox : ${tiles.length}`, 'info');
+    // On calcule d'abord toutes les tuiles de la bbox, puis on filtre sur l'estran
+    const allTiles = bboxToTiles(bbox, zoom);
+    log(`Tuiles bbox totales zoom ${zoom} : ${allTiles.length}`, 'info');
 
-    if (tiles.length > 2000) {
-      log(`⚠ ${tiles.length} tuiles — cela peut prendre du temps et consommer de la mémoire.`, 'warn');
+    // Filtrage strict sur le polygone estran
+    const tiles = allTiles.filter(t => {
+      const sw = tileToWGS84(t.x,   t.y+1, t.z);
+      const ne = tileToWGS84(t.x+1, t.y,   t.z);
+      const tileBox = turf.bboxPolygon([sw.lon, sw.lat, ne.lon, ne.lat]);
+      try { return turf.booleanIntersects(estranPoly, tileBox); }
+      catch { return false; }
+    });
+    log(`Tuiles intersectant l'estran : ${tiles.length} (sur ${allTiles.length} dans la bbox)`, 'ok');
+
+    if (tiles.length === 0) {
+      throw new Error('Aucune tuile ortho ne recouvre le polygone estran — bbox trop petite ?');
+    }
+    if (tiles.length > 3000) {
+      log(`⚠ ${tiles.length} tuiles — résolution trop élevée pour cette surface. Réduisez le zoom ou la zone.`, 'warn');
     }
 
     // ── ÉTAPE 4 : MBTiles ─────────────────────────────────────────
     setProgress('Assemblage MBTiles…', 55);
-    log('Démarrage de l\'assemblage MBTiles…', 'info');
+    log('Assemblage MBTiles (tuiles estran uniquement)…', 'info');
 
-    const mbtData = await buildMBTiles(tiles, estranPoly, zoom, (done, total) => {
+    // On passe null comme estranPoly à buildMBTiles car le filtre est déjà fait ci-dessus
+    const mbtData = await buildMBTiles(tiles, null, zoom, (done, total) => {
       const pct = 55 + 40 * (done / total);
       setProgress(`Tuiles : ${done}/${total}`, pct);
     });

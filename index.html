@@ -340,11 +340,12 @@
         </select>
       </div>
       <div class="field-row">
-        <label>Zoom tuiles ortho</label>
+        <label>Zoom tuiles ortho (résolution)</label>
         <select id="orthoZoom">
-          <option value="16">16</option>
-          <option value="17" selected>17</option>
-          <option value="18">18</option>
+          <option value="16">16 — ~2,4 m/px</option>
+          <option value="17">17 — ~1,2 m/px</option>
+          <option value="18" selected>18 — ~0,6 m/px ✓ recommandé</option>
+          <option value="19">19 — ~0,3 m/px (lent)</option>
         </select>
       </div>
     </div>
@@ -404,7 +405,7 @@
 </div>
 <script>
 // Détection mise à jour SW + cache-buster
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js').then(reg => {
     reg.addEventListener('updatefound', () => {
@@ -422,6 +423,6 @@ if ('serviceWorker' in navigator) {
   });
 }
 </script>
-<script src="app.js?v=1.1.0"></script>
+<script src="app.js?v=1.2.0"></script>
 </body>
 </html>
