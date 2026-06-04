@@ -506,8 +506,17 @@ async function buildMBTiles(tiles, estranPoly, zoom, onProgress) {
   }
 
   stmt.free();
-  const data = db.export();
+  log('Export SQLite en cours…', 'info');
+  let data;
+  try {
+    data = db.export(); // Uint8Array
+  } catch(e) {
+    db.close();
+    throw new Error('Échec export SQLite : ' + e.message);
+  }
   db.close();
+  if (!data || data.byteLength === 0) throw new Error('Export SQLite vide — aucune tuile insérée ?');
+  log(`SQLite exporté : ${(data.byteLength/1024).toFixed(0)} Ko`, 'ok');
   return data;
 }
 
@@ -524,10 +533,12 @@ async function runPipeline() {
   setStatus('running');
 
   const bbox    = state.bbox;
-  const pbmeAlt = parseFloat($('pbmeAlt').value);   // altitude basse (zéro hydro, négatif)
-  const pmveAlt = parseFloat($('pmveAlt').value) || 5.0; // altitude haute (PMVE)
+  const pbmeAlt = isNaN(parseFloat($('pbmeAlt').value)) ? -3.0 : parseFloat($('pbmeAlt').value);
+  const pmveAlt = isNaN(parseFloat($('pmveAlt').value)) ?  5.0 : parseFloat($('pmveAlt').value);
   const res     = parseInt($('mntRes').value) || 5;
-  const zoom    = parseInt($('orthoZoom').value) || 17;
+  const zoom    = parseInt($('orthoZoom').value) || 18;
+
+  log(`Paramètres : altitude basse=${pbmeAlt} m, PMVE=${pmveAlt} m, résolution=${res} m, zoom=${zoom}`, 'info');
 
   try {
     // ── ÉTAPE 1 : MNT via API REST IGN altimétrique ───────────────
@@ -605,28 +616,35 @@ async function runPipeline() {
     });
 
     state.mbtData = mbtData;
-    const sizeKo = (mbtData.byteLength / 1024).toFixed(1);
-    const sizeMo = (mbtData.byteLength / 1024 / 1024).toFixed(2);
+    const bytes  = mbtData.byteLength;
+    const sizeTxt = bytes > 1024*1024
+      ? `${(bytes/1024/1024).toFixed(2)} Mo`
+      : `${(bytes/1024).toFixed(1)} Ko`;
 
-    // ── ÉTAPE 5 : Proposer le téléchargement ──────────────────────
+    // ── ÉTAPE 5 : Téléchargement ──────────────────────────────────
+    setProgress('Téléchargement…', 98);
+    log(`MBTiles prêt : ${sizeTxt} — déclenchement du téléchargement…`, 'ok');
+
+    // Déclencher immédiatement le téléchargement
+    triggerDownload(mbtData);
+
     setProgress('Terminé !', 100);
     setStatus('done');
-
-    $('mbtSize').textContent = sizeKo > 1024 ? `${sizeMo} Mo` : `${sizeKo} Ko`;
+    $('mbtSize').textContent = sizeTxt;
     downloadZone.classList.add('visible');
-    log(`MBTiles généré : ${sizeMo} Mo — prêt au téléchargement.`, 'ok');
-    log('Pipeline terminé avec succès.', 'ok');
+    log('Pipeline terminé. Fichier estran.mbtiles téléchargé.', 'ok');
 
   } catch(err) {
-    if (err.message === 'Annulé' || err.name === 'AbortError') {
+    if (err.name === 'AbortError' || err.message === 'Annulé') {
       log('Traitement annulé.', 'warn');
       setStatus('idle');
       setProgress('Annulé', 0);
     } else {
-      log(`ERREUR : ${err.message}`, 'err');
-      console.error(err);
+      const msg = err.message || String(err);
+      log(`ERREUR : ${msg}`, 'err');
+      if (err.stack) console.error('[Platier] Pipeline error:', err.stack);
       setStatus('error');
-      setProgress('Erreur', 0);
+      setProgress('Erreur — voir le log', 0);
     }
   } finally {
     $('btnProcess').disabled = false;
@@ -636,15 +654,26 @@ async function runPipeline() {
 }
 
 // ─── TÉLÉCHARGEMENT ───────────────────────────────────────────────
+function triggerDownload(data) {
+  try {
+    const blob = new Blob([data.buffer || data], { type: 'application/x-sqlite3' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = 'estran.mbtiles';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    log('Téléchargement démarré : estran.mbtiles', 'ok');
+  } catch(e) {
+    log('Erreur lors du téléchargement : ' + e.message, 'err');
+  }
+}
+
 $('btnDownload').addEventListener('click', () => {
-  if (!state.mbtData) return;
-  const blob = new Blob([state.mbtData], { type: 'application/x-sqlite3' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href = url; a.download = 'estran.mbtiles';
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
-  log('Téléchargement démarré : estran.mbtiles', 'ok');
+  if (!state.mbtData) { log('Aucun fichier disponible.', 'warn'); return; }
+  triggerDownload(state.mbtData);
 });
 
 $('btnProcess').addEventListener('click', runPipeline);

@@ -401,9 +401,9 @@
 </div>
 
 <!-- Bannière de mise à jour SW -->
-<div id="swUpdateBanner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;
+<div id="swUpdateBanner" style="position:fixed;top:0;left:0;right:0;z-index:9999;
   background:#f0a500;color:#06111f;padding:8px 16px;font-size:13px;font-weight:600;
-  display:none;align-items:center;gap:12px;justify-content:center;">
+  align-items:center;gap:12px;justify-content:center;display:none;">
   ⚡ Nouvelle version disponible —
   <button onclick="window.location.reload(true)"
     style="background:#06111f;color:#f0a500;border:none;padding:4px 12px;
@@ -413,7 +413,7 @@
 </div>
 <script>
 // Détection mise à jour SW + cache-buster
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.5.0';
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js').then(reg => {
     reg.addEventListener('updatefound', () => {
@@ -431,6 +431,6 @@ if ('serviceWorker' in navigator) {
   });
 }
 </script>
-<script src="app.js?v=1.4.0"></script>
+<script src="app.js?v=1.5.0"></script>
 </body>
 </html>
