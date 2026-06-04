@@ -252,8 +252,8 @@ async function fetchMNT(bbox, res, onProgress) {
     const elevs = data.elevations || [];
     for (let j = 0; j < elevs.length; j++) {
       const z = elevs[j].z;
-      // IGN retourne -99999 pour les zones non couvertes
-      grid[i + j] = (z === null || z < -9990) ? NaN : z;
+      // IGN nodata exact = -99999 (ne pas confondre avec altitudes marines négatives légitimes)
+      grid[i + j] = (z === null || z === undefined || z <= -99990) ? NaN : z;
     }
 
     if (onProgress) onProgress(Math.min(i + ALTI_BATCH_SIZE, total), total);
@@ -274,173 +274,133 @@ async function fetchMNT(bbox, res, onProgress) {
   return { grid, width: cols, height: rows, bbox };
 }
 
-// ─── EXTRACTION CONTOUR ESTRAN ────────────────────────────────────
-// Méthode : marching squares simplifié pour les isocontours 0m et PMVE
-function marchingSquaresIso(grid, w, h, isoVal) {
-  // Retourne un tableau de polylignes [[x,y], ...]
-  const segments = [];
-  for (let row = 0; row < h - 1; row++) {
-    for (let col = 0; col < w - 1; col++) {
-      const tl = grid[row * w + col];
-      const tr = grid[row * w + col + 1];
-      const bl = grid[(row+1) * w + col];
-      const br = grid[(row+1) * w + col + 1];
-      if (isNaN(tl)||isNaN(tr)||isNaN(bl)||isNaN(br)) continue;
-      const idx =
-        (tl >= isoVal ? 8 : 0) |
-        (tr >= isoVal ? 4 : 0) |
-        (br >= isoVal ? 2 : 0) |
-        (bl >= isoVal ? 1 : 0);
-      if (idx === 0 || idx === 15) continue;
-      // Interpolation linéaire
-      function lerp(a, b) { return (isoVal - a) / (b - a); }
-      const top    = col + lerp(tl, tr);
-      const right  = row + lerp(tr, br);
-      const bottom = col + lerp(bl, br);
-      const left   = row + lerp(tl, bl);
-      const pts = {
-        t: [top, row], b: [bottom, row+1],
-        l: [col, left], r: [col+1, right],
-      };
-      const cases = {
-        1:  [pts.l, pts.b], 2:  [pts.b, pts.r],
-        3:  [pts.l, pts.r], 4:  [pts.t, pts.r],
-        5:  [pts.t, pts.l, pts.b, pts.r], // saddle
-        6:  [pts.t, pts.b], 7:  [pts.t, pts.l],
-        8:  [pts.t, pts.l], 9:  [pts.t, pts.b],
-        10: [pts.t, pts.r, pts.b, pts.l], // saddle
-        11: [pts.t, pts.r], 12: [pts.l, pts.r],
-        13: [pts.b, pts.r], 14: [pts.l, pts.b],
-      };
-      const segs = cases[idx];
-      if (!segs) continue;
-      for (let i = 0; i < segs.length; i += 2) {
-        if (segs[i] && segs[i+1]) segments.push([segs[i], segs[i+1]]);
-      }
-    }
-  }
-  return segments;
-}
-
-// Convertit coordonnées pixel → WGS84
-function pixelToWGS84(px, py, width, height, bbox) {
-  const lon = bbox.minLon + (px / width)  * (bbox.maxLon - bbox.minLon);
-  const lat = bbox.maxLat - (py / height) * (bbox.maxLat - bbox.minLat);
-  return [lon, lat];
-}
-
-// Connecte les segments en polylignes
-function connectSegments(segments, width, height, bbox) {
-  const lines = segments.map(seg => seg.map(([px,py]) => pixelToWGS84(px, py, width, height, bbox)));
-  // Assemblage en chaînes par correspondance de points
-  if (lines.length === 0) return [];
-  const eps = 1e-7;
-  const used = new Uint8Array(lines.length);
-  const chains = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (used[i]) continue;
-    used[i] = 1;
-    let chain = [...lines[i]];
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (let j = 0; j < lines.length; j++) {
-        if (used[j]) continue;
-        const head = chain[0]; const tail = chain[chain.length-1];
-        const a = lines[j][0]; const b = lines[j][1];
-        if (Math.abs(tail[0]-a[0])<eps && Math.abs(tail[1]-a[1])<eps) {
-          chain.push(b); used[j]=1; changed=true;
-        } else if (Math.abs(tail[0]-b[0])<eps && Math.abs(tail[1]-b[1])<eps) {
-          chain.push(a); used[j]=1; changed=true;
-        } else if (Math.abs(head[0]-b[0])<eps && Math.abs(head[1]-b[1])<eps) {
-          chain.unshift(a); used[j]=1; changed=true;
-        } else if (Math.abs(head[0]-a[0])<eps && Math.abs(head[1]-a[1])<eps) {
-          chain.unshift(b); used[j]=1; changed=true;
-        }
-      }
-    }
-    chains.push(chain);
-  }
-  return chains;
-}
-
 // ─── CONSTRUCTION POLYGONE ESTRAN ─────────────────────────────────
+// Méthode : masque raster binaire → marching squares → anneaux WGS84
 function buildEstranPolygon(grid, width, height, bbox, pmveAlt) {
-  log('Calcul des isocontours 0 m NGF…', 'info');
-  const segs0    = marchingSquaresIso(grid, width, height, 0.0);
-  log(`Calcul des isocontours PMVE (${pmveAlt} m NGF)…`, 'info');
-  const segsPMVE = marchingSquaresIso(grid, width, height, pmveAlt);
-
-  const chains0    = connectSegments(segs0,    width, height, bbox);
-  const chainsPMVE = connectSegments(segsPMVE, width, height, bbox);
-
-  log(`Isocontour 0 m : ${chains0.length} chaîne(s)`, 'info');
-  log(`Isocontour PMVE : ${chainsPMVE.length} chaîne(s)`, 'info');
-
-  // Limites latérales : bords ouest et est de la bbox
-  const bboxPoly = [
-    [bbox.minLon, bbox.minLat],
-    [bbox.minLon, bbox.maxLat],
-    [bbox.maxLon, bbox.maxLat],
-    [bbox.maxLon, bbox.minLat],
-    [bbox.minLon, bbox.minLat],
-  ];
-
-  // Construire le polygone estran = zone entre 0m et PMVE
-  // On utilise Turf pour les opérations booléennes
-  const rings = [];
-
-  // Créer des polygones "à partir de la côte" entre les deux isocontours
-  // Méthode simplifiée : masque entre les deux niveaux
+  log(`Extraction masque estran [0 – ${pmveAlt} m NGF]…`, 'info');
   const estranMask = buildEstranMask(grid, width, height, bbox, pmveAlt);
-
-  if (!estranMask) {
-    log('Impossible de construire le masque estran (données insuffisantes)', 'warn');
-    return null;
-  }
-
+  if (!estranMask) return null;
   log('Nettoyage géométrique (suppression îlots < ' + MIN_AREA_M2 + ' m²)…', 'info');
-  const cleaned = cleanPolygon(estranMask);
-  return cleaned;
+  return cleanPolygon(estranMask);
 }
 
 function buildEstranMask(grid, width, height, bbox, pmveAlt) {
-  // Crée un GeoJSON polygon = union des cellules où 0 <= altitude <= pmveAlt
-  const rings = [];
+  // Approche raster : on crée un masque binaire (1 = estran, 0 = hors estran)
+  // puis on extrait le contour par marching squares sur ce masque.
+  // Beaucoup plus rapide et fiable que l'union Turf cellule par cellule.
+
+  // Masque binaire : 1 si 0 <= z <= pmveAlt, 0 sinon
+  const mask = new Uint8Array(width * height);
+  let cellCount = 0;
+  for (let i = 0; i < grid.length; i++) {
+    const v = grid[i];
+    if (!isNaN(v) && v >= 0 && v <= pmveAlt) { mask[i] = 1; cellCount++; }
+  }
+
+  log(`${cellCount} cellules estran identifiées (masque raster)…`, 'info');
+  if (cellCount === 0) return null;
+
+  // Extraction de contour par marching squares sur le masque binaire
+  // On traite le masque comme une image scalaire avec isoValeur 0.5
+  const segments = [];
+  for (let row = 0; row < height - 1; row++) {
+    for (let col = 0; col < width - 1; col++) {
+      const tl = mask[row * width + col];
+      const tr = mask[row * width + col + 1];
+      const bl = mask[(row+1) * width + col];
+      const br = mask[(row+1) * width + col + 1];
+      const idx = (tl<<3)|(tr<<2)|(br<<1)|bl;
+      if (idx === 0 || idx === 15) continue;
+
+      // Points interpolés sur les 4 bords de la cellule (en coordonnées pixel)
+      const top    = [col + 0.5, row];
+      const bot    = [col + 0.5, row + 1];
+      const left   = [col,       row + 0.5];
+      const right  = [col + 1,   row + 0.5];
+
+      const table = {
+        1:  [[left, bot]],
+        2:  [[bot, right]],
+        3:  [[left, right]],
+        4:  [[top, right]],
+        5:  [[top, left], [bot, right]],   // selle
+        6:  [[top, bot]],
+        7:  [[top, left]],
+        8:  [[top, left]],
+        9:  [[top, bot]],
+        10: [[top, right], [bot, left]],   // selle
+        11: [[top, right]],
+        12: [[left, right]],
+        13: [[bot, right]],
+        14: [[left, bot]],
+      };
+      for (const seg of (table[idx] || [])) segments.push(seg);
+    }
+  }
+
+  if (segments.length === 0) return null;
+
+  // Convertir pixel → WGS84
   const cellW = (bbox.maxLon - bbox.minLon) / width;
   const cellH = (bbox.maxLat - bbox.minLat) / height;
-
-  // Rassemble les cellules dans la plage altitudinale
-  const polys = [];
-  for (let row = 0; row < height; row++) {
-    for (let col = 0; col < width; col++) {
-      const v = grid[row * width + col];
-      if (isNaN(v)) continue;
-      if (v >= 0 && v <= pmveAlt) {
-        const lon = bbox.minLon + col * cellW;
-        const lat = bbox.maxLat - (row+1) * cellH;
-        polys.push(turf.bboxPolygon([lon, lat, lon+cellW, lat+cellH]));
-      }
-    }
+  function px2wgs([px, py]) {
+    return [bbox.minLon + px * cellW, bbox.maxLat - py * cellH];
   }
+  const wgsSegs = segments.map(([a, b]) => [px2wgs(a), px2wgs(b)]);
+
+  // Assemblage des segments en anneaux fermés
+  const rings = assembleRings(wgsSegs);
+  if (rings.length === 0) return null;
+
+  log(`${rings.length} anneau(x) extrait(s) du masque estran`, 'info');
+
+  // Construire GeoJSON MultiPolygon depuis les anneaux
+  // Heuristique : anneaux > 4 points → polygone externe ; sinon trou potentiel
+  const polys = rings
+    .filter(r => r.length >= 4)
+    .map(r => {
+      // Fermer l'anneau
+      if (r[0][0] !== r[r.length-1][0] || r[0][1] !== r[r.length-1][1]) r.push(r[0]);
+      return r;
+    });
 
   if (polys.length === 0) return null;
+  if (polys.length === 1) return turf.polygon([polys[0]]);
+  return turf.multiPolygon(polys.map(p => [p]));
+}
 
-  log(`${polys.length} cellules estran identifiées, union en cours…`, 'info');
+// Assemble des segments [[A,B], [B,C], …] en anneaux fermés
+function assembleRings(segments) {
+  if (segments.length === 0) return [];
+  const eps = 1e-8;
+  const used = new Uint8Array(segments.length);
+  const rings = [];
 
-  // Union par lots pour les grandes zones
-  let merged = polys[0];
-  const batchSize = 200;
-  for (let i = 1; i < polys.length; i += batchSize) {
-    const batch = polys.slice(i, i + batchSize);
-    const fc = turf.featureCollection([merged, ...batch]);
-    try {
-      merged = turf.union(...fc.features);
-    } catch(e) {
-      // si union échoue, conserver merged
-    }
+  function ptEq(a, b) {
+    return Math.abs(a[0]-b[0]) < eps && Math.abs(a[1]-b[1]) < eps;
   }
-  return merged;
+
+  for (let start = 0; start < segments.length; start++) {
+    if (used[start]) continue;
+    used[start] = 1;
+    const ring = [...segments[start]];
+    let changed = true;
+    while (changed && ring[0] !== ring[ring.length-1]) {
+      changed = false;
+      const tail = ring[ring.length-1];
+      for (let j = 0; j < segments.length; j++) {
+        if (used[j]) continue;
+        if (ptEq(segments[j][0], tail)) {
+          ring.push(segments[j][1]); used[j] = 1; changed = true; break;
+        }
+        if (ptEq(segments[j][1], tail)) {
+          ring.push(segments[j][0]); used[j] = 1; changed = true; break;
+        }
+      }
+    }
+    if (ring.length >= 4) rings.push(ring);
+  }
+  return rings;
 }
 
 function cleanPolygon(geojson) {
