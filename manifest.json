@@ -1,0 +1,28 @@
+{
+  "name": "Platier CL — Extracteur d'estran IGN",
+  "short_name": "Platier CL",
+  "description": "Extraction de polygones estran à partir du RGE Alti IGN et des données SHOM, avec export MBTiles",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#06111f",
+  "theme_color": "#0a1628",
+  "orientation": "any",
+  "lang": "fr",
+  "categories": ["map", "utilities", "navigation"],
+  "icons": [
+    {
+      "src": "icon192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "screenshots": [],
+  "shortcuts": []
+}
